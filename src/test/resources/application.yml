@@ -18,3 +18,9 @@ shiro:
 mybatis-plus:
   configuration:
     map-underscore-to-camel-case: true
+
+# 测试中关闭窗口收窄定时扫描，避免后台线程干扰事务回滚测试
+evops:
+  shift-warning:
+    scan:
+      enabled: false

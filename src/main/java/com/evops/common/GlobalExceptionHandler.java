@@ -22,6 +22,12 @@ public class GlobalExceptionHandler {
         return ApiResponse.fail(ex.getMessage(), ex.getConflicts());
     }
 
+    /** 候选班次生成不可行：返回全部拦截原因 */
+    @ExceptionHandler(ShiftPlanException.class)
+    public ApiResponse<List<String>> handleShiftPlan(ShiftPlanException ex) {
+        return ApiResponse.fail(ex.getMessage(), ex.getReasons());
+    }
+
     @ExceptionHandler(BindException.class)
     public ApiResponse<Void> handleBind(BindException ex) {
         FieldError error = ex.getBindingResult().getFieldError();

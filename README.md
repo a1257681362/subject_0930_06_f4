@@ -152,3 +152,59 @@ GET    /api/annotations/{id}/trace          反查：分类/原单/处理人/异
 ### 验证
 
 - `DefectManagementTest`：时限配置预置与调整、登记生成时限与建议、影像标注落库、复核升降级（初判不变/建议重生成/责任人记录/时限重算/同级拒绝）、已关闭只能追加说明、标注反查三要素、未配置组合拒绝登记。
+
+## F4 高空作业排班
+
+在 F1–F3 基础上新增高空作业排班（schema 版本 `f4-1`）：读取风速、降雨、雷电三类安全窗口，结合人员资质、装备可用性与维修时长生成候选班次；窗口收窄只预警不静默改期；作业开始前强制二次确认天气；延期保留原计划与通知回执；过期资质人员不得排入。
+
+### 数据表
+
+| 表 | 说明 |
+| --- | --- |
+| `t_weather_window` | 风速/降雨/雷电安全窗口，统一左闭右开 `[window_from, window_to)`；风速窗口带 `safe_max_value`；按 `(source_channel, source_doc_no, weather_type)` 幂等；`replaces_source_doc_no` 标记修正预报替换的旧窗口（旧窗口留痕但不参与排班） |
+| `t_worker` / `t_worker_qualification` | 作业人员与资质；资质有效期 `[valid_from, valid_to)` 左闭右开，到期当刻即失效 |
+| `t_equipment` | 装备与可用窗口；维修中（`IN_REPAIR`，`[now, repair_finish_at)`）不可被新班次占用 |
+| `t_work_shift` | 候选/确认班次；`planned_*` 为原计划永不修改，`current_*` 为当前执行时间；`feasible_*` 为生成时刻三窗口交集；`result_key` 保证同一排产意图只落一条结果 |
+| `t_shift_warning` | 收窄预警（`NARROWED`/`UNCOVERED`）；按 `warning_key` 幂等，重复扫描不重复告警 |
+| `t_postponement` | 延期记录：`seq` 班次内递增，`original_*` 始终引用最初原计划，`new_*` 为本次延期时间 |
+| `t_notification_receipt` | 通知送达回执；按 `(shift_id, postponement_id, channel)` 幂等，重试复用不重复通知 |
+
+### 业务规则
+
+- **候选班次生成**：三类气象窗口同类先取并集（多来源补传互补）、三类再取交集，一律左闭右开，交集取 `[max(from), min(to))`；在交集中按维修时长寻找不早于 `notBefore` 的最早连续可行起点；再校验装备可用性与班组资质。任一条件不满足整单不落库，返回全部拦截原因（窗口缺失/维修时长放不下/装备维修中/有效资质人员不足）。
+- **资质口径**：作业开始时刻 `t` 必须满足 `valid_from <= t < valid_to`，资质等级不低于要求（`ADVANCED` 兼容 `PRIMARY`）。**过期（含到期当刻）人员不会被排入**；人员不足按“需要 N 人仅 M 人”拦截。延期时对新开始时刻重新逐人复核资质。
+- **窗口收窄只预警不改期**：气象数据补传/补录/重试或修正预报（`replaces_source_doc_no`）后，重算交集。仍覆盖当前作业区间但区间变短 → `NARROWED`；不再完整覆盖 → `UNCOVERED`。系统只写预警并发通知，**绝不自动修改计划时间、不自动生成延期**；改期只能由人工显式调用延期接口。
+- **开工前二次确认天气**：`CANDIDATE/CONFIRMED` 班次开工前必须重新读取三窗口，确认当前作业区间被完整覆盖、现场结论安全（`fieldSafe`）、实测风速不超过覆盖窗口的安全上限；通过才置 `CONFIRMED` 并留天气快照，未通过禁止开工（不自动改期）。
+- **延期保留原计划与回执**：延期写 `t_postponement`（`original_*` 永不漂移），只更新班次 `current_*`；延期目标时段必须被最新窗口交集完整覆盖。按 `SMS/APP/EMAIL` 等通道各留一条送达回执，发送重试复用同一回执。
+- **幂等（补传/补录/重试只有一条可用结果）**：气象窗口按来源单据去重；候选班次按 `result_key`（风机+工作内容+资质+人数+时长+装备类型+不早于时刻）去重，重复提交返回同一条；收窄预警按收窄后区间去重；通知回执按通道去重。
+
+### 接口一览
+
+```
+POST   /api/weather-windows                    接入风速/降雨/雷电窗口（补传/补录/重试幂等；replacesSourceDocNo 修正预报）
+GET    /api/weather-windows                    查询某风机某类窗口（含场址级，已剔除被替换窗口）
+POST   /api/workers                            作业人员建档
+POST   /api/workers/{id}/qualifications        登记资质（有效期左闭右开）
+GET    /api/workers/{id}/qualifications        资质列表
+POST   /api/equipments                         装备建档
+POST   /api/equipments/{id}/repair             装备送修（维修完成前不可用）
+POST   /api/equipments/{id}/repair-finish      维修完成恢复可用
+POST   /api/high-work/shifts                   生成候选班次（同一排产意图只返回一条）
+GET    /api/high-work/shifts/{id}              班次详情（含预警/延期/回执）
+POST   /api/high-work/shifts/{id}/confirm-weather  开工前天气二次确认
+POST   /api/high-work/shifts/{id}/start        开工（须先通过二次确认）
+POST   /api/high-work/shifts/{id}/complete     完成
+POST   /api/high-work/shifts/{id}/cancel       取消（未开工）
+POST   /api/high-work/shifts/{id}/postpone     人工延期（保留原计划+通知回执）
+POST   /api/high-work/shifts/{id}/rescan       单班次收窄即时核对
+POST   /api/high-work/shifts/rescan-all        全量收窄扫描
+GET    /api/high-work/shifts/{id}/warnings     收窄预警
+GET    /api/high-work/shifts/{id}/postponements 延期记录（含原计划）
+GET    /api/high-work/shifts/{id}/receipts     通知回执
+```
+
+收窄扫描另有定时任务 `ShiftWarningJob`（默认 5 分钟，开关 `evops.shift-warning.scan.enabled`，测试环境关闭）；定时任务只预警，任何异常都不会触发改期。
+
+### 验证
+
+- `HighWorkScheduleTest`（10 例）：三窗口交集+资质+装备+维修时长生成候选；交集放不下被拦截；到期当刻资质失效不可排入；维修中装备不可占用；补传/重试窗口与排班幂等只一条；修正预报收窄预警且原计划/状态不变、重复扫描不重复告警；收窄致不覆盖时高危预警不自动改期；开工前二次确认（覆盖/实测风速超限/现场不安全）；延期保留原计划、回执按通道幂等可重试、二次延期 `seq` 递增且原计划不漂移；延期到资质过期时刻被拒绝。

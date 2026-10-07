@@ -32,6 +32,10 @@ public class ShiroConfig {
         chain.addPathDefinition("/api/flight-tasks/**", "anon");
         chain.addPathDefinition("/api/route-changes/**", "anon");
         chain.addPathDefinition("/api/audit-events/**", "anon");
+        chain.addPathDefinition("/api/weather-windows/**", "anon");
+        chain.addPathDefinition("/api/workers/**", "anon");
+        chain.addPathDefinition("/api/equipments/**", "anon");
+        chain.addPathDefinition("/api/high-work/**", "anon");
         chain.addPathDefinition("/**", "authc");
         return chain;
     }
