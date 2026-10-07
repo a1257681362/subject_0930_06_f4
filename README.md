@@ -152,3 +152,56 @@ GET    /api/annotations/{id}/trace          反查：分类/原单/处理人/异
 ### 验证
 
 - `DefectManagementTest`：时限配置预置与调整、登记生成时限与建议、影像标注落库、复核升降级（初判不变/建议重生成/责任人记录/时限重算/同级拒绝）、已关闭只能追加说明、标注反查三要素、未配置组合拒绝登记。
+
+## F4 高空作业排班
+
+在 F1-F3 基础上新增高空作业排班（schema 版本 `f4-1`）：读取风速、降雨和雷电天气窗口，结合人员资质、装备可用性与维修时长生成候选班次；窗口收窄自动预警但不静默改期；作业开始前二次确认天气；延期保留原计划与通知回执；过期资质人员不能被排入任务。
+
+### 数据表
+
+| 表 | 说明 |
+| --- | --- |
+| `t_worker` | 人员：资质类型 + 有效期；过期资质不能被排入任务 |
+| `t_equipment` | 装备：可用状态 + 可用窗口 `[available_from, available_to)`，空表示不限 |
+| `t_weather_window` | 天气窗口：风速/降雨/雷电；同一风机的重叠窗口归并为一条，补传/补录/重试递增 `revision` |
+| `t_maintenance_task` | 高空作业任务：资质要求 + 人数 + 装备类型 + 维修时长；状态 `PLANNING/SCHEDULED/IN_PROGRESS/COMPLETED/CANCELLED` |
+| `t_work_shift` | 班次：候选/确认/作业中/完成/被取代/取消；`original_start/end` 固化原计划 |
+| `t_shift_assignment` | 班次人员/装备分配 |
+| `t_weather_confirmation` | 作业前二次确认：每次一条，开工以最近一次 `PASS` 为准 |
+| `t_shift_postpone` | 延期记录：每次一条，保留新旧计划并关联通知回执 |
+| `t_shift_notification` | 通知回执：窗口收窄预警 / 延期通知；冗余 `task_id` 便于追溯 |
+
+### 业务规则
+
+- **天气窗口幂等归并**：同一风机的重叠窗口为同一逻辑窗口；补传、补录和重试只更新该条记录（起止与读数以最新上报为准，`revision` 递增），"风速窗口与高空作业排班"只形成一条可用结果。
+- **适窗条件**：最大风速 ≤ 10.0 m/s、无降雨、雷电风险 `NONE`（`WeatherWindowService` 常量）。
+- **候选班次**：班次 = 适窗窗口起点起、维修时长的一段，须落在窗口内；人员须在职、资质类型匹配且**有效期覆盖整个班次**（过期资质不能被排入）；装备须可用且可用窗口覆盖整个班次。生成幂等：重新生成先清除上一轮落选班次再重建，不堆积重复候选；已确认班次的任务拒绝重新生成。
+- **唯一可用结果**：每个任务至多一个确认班次；确认时其余候选自动取代（`SUPERSEDED`），重复确认幂等返回原结果；确认时复核人员资质，过期/离职拦截。
+- **窗口收窄预警**：窗口归并更新后重新评估受影响班次，不再适窗的自动向值班调度发预警通知（留回执），**但系统不静默改期**——班次时刻保持不变，改期只能走显式延期。
+- **二次确认**：开工前必须对当前天气二次确认，最近一次结果为 `PASS` 才允许开工。
+- **延期**：仅已确认班次可延期；首次延期把当前计划固化为原计划（`original_start/end`，之后不再改变）；每次延期留存延期记录（新旧计划 + 原因 + 操作人）与通知回执（回执编号唯一）。
+
+### 接口一览
+
+```
+POST   /api/weather-windows                     上报天气窗口（补传/补录/重试幂等归并）
+GET    /api/weather-windows?turbineId=          窗口列表
+POST   /api/workers                             人员登记（资质类型 + 有效期）
+GET    /api/workers                             人员列表
+POST   /api/equipment                           装备登记（可用窗口可空）
+GET    /api/equipment                           装备列表
+POST   /api/maintenance-tasks                   创建高空作业任务
+GET    /api/maintenance-tasks/{id}              任务详情（含全部班次）
+POST   /api/maintenance-tasks/{id}/generate-shifts  生成候选班次（幂等）
+POST   /api/shifts/{id}/confirm                 确认班次（任务唯一可用结果）
+POST   /api/shifts/{id}/confirm-weather         作业前二次确认天气
+POST   /api/shifts/{id}/start                   开工（须二次确认 PASS）
+POST   /api/shifts/{id}/complete                完工
+POST   /api/shifts/{id}/postpone                延期（保留原计划与通知回执）
+POST   /api/shifts/{id}/cancel                  取消（确认取消后任务回到排班中）
+GET    /api/shifts/{id}                         班次详情（分配/确认/延期/回执）
+```
+
+### 验证
+
+- `HighAltitudeSchedulingTest`：窗口补传/补录/重试只形成一条可用结果（`revision` 递增）、候选班次综合过滤（过期资质/类型不匹配/维保装备/窗口过短/条件不适窗均排除）、生成幂等不堆积、确认唯一且幂等、确认时资质过期拦截、窗口收窄与条件恶化自动预警且班次不变、二次确认未通过不能开工、延期保留原计划与通知回执（多次延期原计划不变）、取消确认后可重新生成。
